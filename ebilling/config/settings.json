@@ -1,1 +1,18 @@
+{
+  "sftp_host": "sftp.kaltire.com",
+  "sftp_port": 22,
+  "sftp_user": "ebillingqa",
+  "sftp_password": "xxxxxxx",
+
+  "azure_storage_connection_string": "DefaultEndpointsProtocol=...AccountKey=...;EndpointSuffix=core.windows.net",
+  "blob_container": "synapse",
+
+  "sql_server": "abctyres-devsql2.database.windows.net",
+  "sql_db": "ebillingdb",
+  "sql_user": "sqladminuser",
+  "sql_password": "xxxxxxx",
+
+  "synapse_server": "abctyres-dev-syn-ondemand.sql.azuresynapse.net",
+  "synapse_db": "default"
+}
 
