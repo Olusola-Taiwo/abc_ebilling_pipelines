@@ -70,3 +70,40 @@ ebilling_project/
 │   └── pipeline.json
 │
 └── README.md
+
+## 🔐 Security
+Secrets stored in Azure Key Vault
+ADLS Gen2 secured with RBAC + ACLs
+Synapse workspace uses managed identity
+SQL Database protected with firewall + AAD authentication
+SFTP credentials rotated regularly
+
+## 📈 Monitoring & Logging
+Python logs → logs/pipeline.log
+ADF pipeline run history
+Synapse SQL query logs
+Storage access logs
+SFTP transfer logs
+
+## 🚀 CI/CD (GitHub → ADF)
+GitHub Actions used for deployment
+ADF pipeline JSON stored in /adf/pipeline.json
+Automatic deployment on push to main
+Versioning of Python scripts and metadata
+
+## 🧪 Testing
+Unit tests included in:
+```text
+tests/test_processing.py
+
+Tests cover:
+Metadata lookup
+DDP rule application
+Renaming logic
+Classification logic
+
+## 📬 Contact
+Engineer: Taiwo
+Project: ABC Tyres – eBilling Automation
+Version: 1.0
+Environment: DEV / QA / PROD
