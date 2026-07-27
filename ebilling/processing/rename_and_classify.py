@@ -1,22 +1,17 @@
+import json
 import datetime
 from pathlib import Path
+
+import pandas as pd
+import pyodbc
 from azure.storage.blob import BlobServiceClient
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-AZURE_STORAGE_CONNECTION_STRING = "DefaultEndpointsProtocol=...AccountKey=..."
-CONTAINER = "synapse"
+SETTINGS_PATH = "config/settings.json"
 
-BASE_PATH = "ebilling/invoice"
-RAW_PATH = f"{BASE_PATH}/raw/"
-PASSED_PATH = f"{BASE_PATH}/passed/"
-IGNORED_PATH = f"{BASE_PATH}/ignored/"
-FAILED_PATH = f"{BASE_PATH}/failed/"
+def load_settings():
+    with open(SETTINGS_PATH) as f:
+        return json.load(f)
 
-# -----------------------------
-# HELPERS
-# -----------------------------
 def today():
     return datetime.date.today().strftime("%Y-%m-%d")
 
@@ -27,100 +22,126 @@ def classify(delivery_mode):
         return "ignored"
     return "failed"
 
-def upload_copy(blob_service, src_blob, dest_blob):
-    src_client = blob_service.get_blob_client(CONTAINER, src_blob)
-    dest_client = blob_service.get_blob_client(CONTAINER, dest_blob)
-    dest_client.start_copy_from_url(src_client.url)
+def connect_blob(cfg):
+    return BlobServiceClient.from_connection_string(cfg["azure_storage_connection_string"])
 
-def delete_blob(blob_service, blob_path):
-    blob_service.get_blob_client(CONTAINER, blob_path).delete_blob()
+def connect_sql(cfg):
+    conn_str = (
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"SERVER={cfg['sql_server']};DATABASE={cfg['sql_db']};"
+        f"UID={cfg['sql_user']};PWD={cfg['sql_password']};Encrypt=yes;TrustServerCertificate=no;"
+    )
+    return pyodbc.connect(conn_str)
 
-# -----------------------------
-# MAIN LOGIC
-# -----------------------------
-def rename_and_classify(meta_df, ddp_df):
+def load_metadata_from_synapse(cfg):
+    conn_str = (
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"SERVER={cfg['synapse_server']};DATABASE={cfg['synapse_db']};"
+        f"UID={cfg['sql_user']};PWD={cfg['sql_password']};Encrypt=yes;TrustServerCertificate=no;"
+    )
+    conn = pyodbc.connect(conn_str)
+
+    sql = """
+    SELECT
+        h.EXTERNAL_REF_ID AS invoice_number,
+        (SELECT TOP 1 c.EXTERNAL_CUST_ID
+         FROM dbo.CUSTOMER c
+         WHERE c.CUSTOMER_ID = h.CUSTOMER_ID) AS billto_account,
+        (SELECT TOP 1 c.EXTERNAL_CUST_ID
+         FROM dbo.CUSTOMER c
+         WHERE c.CUSTOMER_ID = h.ALT2_CUSTOMER_ID) AS soldto_account
+    FROM dbo.ORDER_HDR h;
     """
-    meta_df columns:
-        invoice_number, billto_account, soldto_account
+    df = pd.read_sql(sql, conn)
+    conn.close()
+    return df
 
-    ddp_df columns:
-        account_number, doc_type, customer_control, delivery_mode
-    """
+def load_ddp(conn_sql):
+    df = pd.read_sql("SELECT * FROM dbo.DDP;", conn_sql)
+    return df
 
-    blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-    container_client = blob_service.get_container_client(CONTAINER)
+def rename_and_classify():
+    cfg = load_settings()
+    blob_service = connect_blob(cfg)
+    conn_sql = connect_sql(cfg)
 
-    # List raw PDFs
-    raw_blobs = container_client.list_blobs(name_starts_with=RAW_PATH)
+    meta_df = load_metadata_from_synapse(cfg)
+    ddp_df = load_ddp(conn_sql)
+
+    container = cfg["blob_container"]
+    base = "ebilling/invoice"
+    raw_prefix = f"{base}/raw/"
+    passed_prefix = f"{base}/passed/{today()}/"
+    ignored_prefix = f"{base}/ignored/{today()}/"
+    failed_prefix = f"{base}/failed/{today()}/"
+
+    container_client = blob_service.get_container_client(container)
+    raw_blobs = container_client.list_blobs(name_starts_with=raw_prefix)
 
     for blob in raw_blobs:
         fname = Path(blob.name).name
-
-        # Extract invoice number from filename: ABCINVOICE_2024050101.pdf
         invoice_number = Path(fname).stem.replace("ABCINVOICE_", "")
 
-        # Lookup metadata
         meta_row = meta_df[meta_df["invoice_number"] == invoice_number]
         if meta_row.empty:
-            # No metadata → failed
-            dest = f"{FAILED_PATH}/{today()}/{fname}"
-            upload_copy(blob_service, blob.name, dest)
-            delete_blob(blob_service, blob.name)
+            dest = failed_prefix + fname
+            _copy_and_delete(blob_service, container, blob.name, dest)
             continue
 
         meta_row = meta_row.iloc[0]
         billto = meta_row["billto_account"]
         soldto = meta_row["soldto_account"]
 
-        # Lookup DDP (customer control matrix)
         ddp_row = ddp_df[
             (ddp_df["account_number"] == billto) &
             (ddp_df["doc_type"] == "invoice")
         ]
 
         if ddp_row.empty:
-            # No DDP → failed
-            dest = f"{FAILED_PATH}/{today()}/{fname}"
-            upload_copy(blob_service, blob.name, dest)
-            delete_blob(blob_service, blob.name)
+            dest = failed_prefix + fname
+            _copy_and_delete(blob_service, container, blob.name, dest)
             continue
 
         ddp_row = ddp_row.iloc[0]
-        control = ddp_row["customer_control"]      # Key / Sub / Both
-        delivery = ddp_row["delivery_mode"]        # email / print / ignore / None
+        control = ddp_row["customer_control"]
+        delivery = ddp_row["delivery_mode"]
         classification = classify(delivery)
 
-        # -----------------------------
-        # RENAME LOGIC (ABC prefix)
-        # -----------------------------
         new_files = []
-
         if control == "Key":
             new_files.append(f"ABCINV_{invoice_number}_{billto}.pdf")
-
         elif control == "Sub":
             new_files.append(f"ABCINV_{invoice_number}_{soldto}.pdf")
-
         elif control == "Both":
             new_files.append(f"ABCINV_{invoice_number}_{billto}.pdf")
             new_files.append(f"ABCINV_{invoice_number}_{soldto}.pdf")
-
         else:
-            # Unknown control → failed
-            dest = f"{FAILED_PATH}/{today()}/{fname}"
-            upload_copy(blob_service, blob.name, dest)
-            delete_blob(blob_service, blob.name)
+            dest = failed_prefix + fname
+            _copy_and_delete(blob_service, container, blob.name, dest)
             continue
 
-        # -----------------------------
-        # COPY TO CLASSIFICATION FOLDER
-        # -----------------------------
         for new_name in new_files:
-            dest = f"{BASE_PATH}/{classification}/{today()}/{new_name}"
-            upload_copy(blob_service, blob.name, dest)
+            if classification == "passed":
+                dest = passed_prefix + new_name
+            elif classification == "ignored":
+                dest = ignored_prefix + new_name
+            else:
+                dest = failed_prefix + new_name
+            _copy(blob_service, container, blob.name, dest)
 
-        # Delete raw file after processing
-        delete_blob(blob_service, blob.name)
+        blob_service.get_blob_client(container, blob.name).delete_blob()
 
-    print("PDF renaming + classification completed.")
+    conn_sql.close()
+    print("Rename + classification complete.")
 
+def _copy(blob_service, container, src, dest):
+    src_client = blob_service.get_blob_client(container, src)
+    dest_client = blob_service.get_blob_client(container, dest)
+    dest_client.start_copy_from_url(src_client.url)
+
+def _copy_and_delete(blob_service, container, src, dest):
+    _copy(blob_service, container, src, dest)
+    blob_service.get_blob_client(container, src).delete_blob()
+
+if __name__ == "__main__":
+    rename_and_classify()
